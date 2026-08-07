@@ -129,6 +129,11 @@ type IMConfig struct {
 	// When configured, this is used instead of iCloud CardDAV contacts.
 	CardDAV CardDAVConfig `yaml:"carddav"`
 
+	// DisableICloudContacts disables the iCloud CardDAV contact sync. This is
+	// useful on platforms where Apple's private auth endpoint is unavailable;
+	// message sync and backfill continue without contact-name enrichment.
+	DisableICloudContacts bool `yaml:"disable_icloud_contacts"`
+
 	// DebugDisablePrivacy is a DEVELOPMENT-ONLY switch that reverts the
 	// bridge's privacy protections so plaintext is observable for debugging.
 	// MUST be false in any real deployment. Default false. When true:
@@ -249,6 +254,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "statuskit_notifications")
 	helper.Copy(up.Bool, "read_receipts")
 	helper.Copy(up.Bool, "typing_notifications")
+	helper.Copy(up.Bool, "disable_icloud_contacts")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")
 	helper.Copy(up.Str, "carddav", "username")
