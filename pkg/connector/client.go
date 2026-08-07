@@ -1529,6 +1529,8 @@ func (c *IMClient) Connect(ctx context.Context) {
 		} else {
 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
 		}
+	} else if c.Main.Config.DisableICloudContacts {
+		log.Info().Msg("iCloud contacts disabled in config")
 	} else {
 		cloudContacts := newCloudContactsClient(c.client, log)
 		if cloudContacts != nil {
