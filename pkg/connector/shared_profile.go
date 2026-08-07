@@ -349,6 +349,13 @@ func (c *IMClient) lookupSharedProfile(identifier string) *rustpushgo.WrappedPro
 // expired and we're on the retry path).
 func (c *IMClient) refreshSharedProfilesOnConnect(log zerolog.Logger) {
 	c.applyCachedSharedProfilesToGhosts(log)
+	// The CloudKit profile endpoint shares the same private auth path as
+	// iCloud CardDAV. On non-Apple builds that endpoint may panic inside the
+	// upstream client; cached profiles are still safe to apply locally.
+	if c.Main.Config.DisableICloudContacts {
+		log.Debug().Msg("Skipping CloudKit shared-profile refresh because iCloud contacts are disabled")
+		return
+	}
 	c.refreshAllSharedProfiles(log)
 }
 
