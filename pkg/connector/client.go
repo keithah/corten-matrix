@@ -1444,6 +1444,8 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// without needing a fresh login or reconfiguration.
 	if err := c.ensureSharedProfileSchema(context.Background()); err != nil {
 		log.Warn().Err(err).Msg("Failed to ensure shared_profiles schema")
+	} else if c.Main.Config.DisableICloudContacts {
+		log.Info().Msg("iCloud contacts disabled in config")
 	} else {
 		c.loadSharedProfilesIntoCache(context.Background(), log)
 		// Independent of CardDAV: push cached state to ghosts immediately
