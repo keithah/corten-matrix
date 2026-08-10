@@ -14,6 +14,7 @@ RUSTPUSH_DIR := third_party/rustpush-upstream
 # Pinned OpenBubbles/rustpush commit. Edit third_party/rustpush-upstream.sha to
 # bump, then test locally before committing. The Makefile reads the SHA on build
 # and checks out that exact commit — no auto-bump, no branch drift.
+OMNISETTE_DIR := third_party/rustpush-upstream/apple-private-apis/omnisette
 RUSTPUSH_PIN_FILE := third_party/rustpush-upstream.sha
 RUSTPUSH_PIN      := $(shell cat $(RUSTPUSH_PIN_FILE) 2>/dev/null)
 RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(RUSTPUSH_DIR)/apple-private-apis $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
@@ -50,11 +51,21 @@ ifneq ($(UNAME_S),Darwin)
   $(error This bridge builds on macOS only: NAC uses Apple's native AAAbsintheContext framework. Build and run it on a Mac.)
 endif
 
+# Homebrew prefix differs by architecture: /opt/homebrew on Apple Silicon,
+# /usr/local on Intel. Hardcoding the arm64 path made this build fail on Intel
+# Macs with missing olm/heif headers, so detect it instead. Override with
+# `make BREW_PREFIX=...` if Homebrew lives somewhere else.
+BREW_PREFIX ?= $(shell \
+	if [ -x /opt/homebrew/bin/brew ]; then echo /opt/homebrew; \
+	elif [ -x /usr/local/bin/brew ]; then echo /usr/local; \
+	elif command -v brew >/dev/null 2>&1; then brew --prefix; \
+	else echo /opt/homebrew; fi)
+
 # Plain binary (no .app bundle; host ops live in the corten-matrix subcommands).
-export PATH := /opt/homebrew/bin:/opt/homebrew/sbin:$(PATH)
+export PATH := $(BREW_PREFIX)/bin:$(BREW_PREFIX)/sbin:$(PATH)
 BINARY      := $(APP_NAME)
-CGO_CFLAGS  := -I/opt/homebrew/include
-CGO_LDFLAGS := -L/opt/homebrew/lib -L$(CURDIR)
+CGO_CFLAGS  := -I$(BREW_PREFIX)/include
+CGO_LDFLAGS := -L$(BREW_PREFIX)/lib -L$(CURDIR)
 CARGO_ENV   := MACOSX_DEPLOYMENT_TARGET=13.0
 
 # ===========================================================================
@@ -66,14 +77,14 @@ check-deps:
 	@if ! command -v brew >/dev/null 2>&1; then \
 		echo "Installing Homebrew..."; \
 		NONINTERACTIVE=1 /bin/bash -c "$$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; \
-		eval "$$(/opt/homebrew/bin/brew shellenv)"; \
+		eval "$$($(BREW_PREFIX)/bin/brew shellenv)"; \
 	fi; \
 	missing=""; \
 	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
 	command -v cargo >/dev/null 2>&1 || missing="$$missing rust"; \
 	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
 	command -v tmux >/dev/null 2>&1  || missing="$$missing tmux"; \
-	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
+	[ -f $(BREW_PREFIX)/include/olm/olm.h ] || missing="$$missing libolm"; \
 	pkg-config --exists libheif 2>/dev/null || missing="$$missing libheif"; \
 	if [ -n "$$missing" ]; then \
 		echo "Installing dependencies:$$missing"; \
@@ -231,6 +242,10 @@ ensure-rustpush-source:
 		if grep -q 'else { panic!("Channel not found!") };' $(RUSTPUSH_DIR)/src/statuskit.rs 2>/dev/null; then \
 			echo "Softening statuskit.rs:736 panic to warn+Ok(None) (StatusKit reliability — presence-before-keysharing race)..."; \
 			sed -i.bak 's|let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };|let Some(referenced_channel) = state.keys.get_mut(\&base64_encode(\&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(\&channel.id)); return Ok(None); };|' $(RUSTPUSH_DIR)/src/statuskit.rs && rm -f $(RUSTPUSH_DIR)/src/statuskit.rs.bak; \
+		fi; \
+		if grep -q 'let provision_ws_url = format!("{}/v3/provisioning_session", self.url).replace("https://", "wss://");' $(OMNISETTE_DIR)/src/remote_anisette_v3.rs 2>/dev/null; then \
+			echo "Patching remote_anisette_v3.rs to map http->ws as well as https->wss (self-hosted anisette-v3 over plain HTTP)..."; \
+			sed -i.bak 's|let provision_ws_url = format!("{}/v3/provisioning_session", self.url).replace("https://", "wss://");|let provision_ws_url = format!("{}/v3/provisioning_session", self.url).replace("https://", "wss://").replace("http://", "ws://");|' $(OMNISETTE_DIR)/src/remote_anisette_v3.rs && rm -f $(OMNISETTE_DIR)/src/remote_anisette_v3.rs.bak; \
 		fi; \
 	fi
 
