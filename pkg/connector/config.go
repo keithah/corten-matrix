@@ -129,9 +129,9 @@ type IMConfig struct {
 	// When configured, this is used instead of iCloud CardDAV contacts.
 	CardDAV CardDAVConfig `yaml:"carddav"`
 
-	// DisableICloudContacts disables the iCloud CardDAV contact sync. This is
-	// useful on platforms where Apple's private auth endpoint is unavailable;
-	// message sync and backfill continue without contact-name enrichment.
+	// DisableICloudContacts disables iCloud CardDAV contact-name enrichment and
+	// fresh CloudKit shared-profile fetches. Cached profiles are preserved, but
+	// DisplayName, FirstName, LastName, and avatar updates are skipped.
 	DisableICloudContacts bool `yaml:"disable_icloud_contacts"`
 
 	// DebugDisablePrivacy is a DEVELOPMENT-ONLY switch that reverts the

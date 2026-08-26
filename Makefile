@@ -4,6 +4,7 @@ VERSION     := 0.1.0
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 UNAME_S     := $(shell uname -s)
+UNAME_M     := $(shell uname -m)
 
 RUST_LIB    := librustpushgo.a
 RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' -o -name '*.m' -o -name '*.h' 2>/dev/null) \
@@ -59,7 +60,8 @@ BREW_PREFIX ?= $(shell \
 	if [ -x /opt/homebrew/bin/brew ]; then echo /opt/homebrew; \
 	elif [ -x /usr/local/bin/brew ]; then echo /usr/local; \
 	elif command -v brew >/dev/null 2>&1; then brew --prefix; \
-	else echo /opt/homebrew; fi)
+	elif [ "$(UNAME_M)" = "arm64" ]; then echo /opt/homebrew; \
+	else echo /usr/local; fi)
 
 # Plain binary (no .app bundle; host ops live in the corten-matrix subcommands).
 export PATH := $(BREW_PREFIX)/bin:$(BREW_PREFIX)/sbin:$(PATH)
@@ -249,12 +251,11 @@ ensure-rustpush-source:
 		fi; \
 	fi
 
-# `ensure-rustpush-source` is an order-only prereq (the `|` separator):
-# it runs before the recipe when needed, but its phony "always-dirty"
-# timestamp doesn't force $(RUST_LIB) to rebuild on every `make` invocation.
-# Only actual Rust source changes / Cargo.toml changes should trigger a
-# rebuild; the pinned SHA + submodule setup is idempotent once done.
-$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES) | ensure-rustpush-source
+# `ensure-rustpush-source` remains order-only so its phony "always-dirty"
+# timestamp doesn't force a rebuild on every `make`. Makefile is a normal
+# prerequisite so edits to the source-patching recipe rebuild the library
+# after ensure-rustpush-source applies them.
+$(RUST_LIB): Makefile $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES) | ensure-rustpush-source
 	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release $(CARGO_FEATURES)
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 

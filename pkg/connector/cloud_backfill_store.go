@@ -3774,7 +3774,7 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		select {
 		case <-ctx.Done():
 			return total, ctx.Err()
-		default:
+		case <-time.After(50 * time.Millisecond):
 		}
 	}
 	return total, nil

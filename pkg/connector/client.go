@@ -8025,6 +8025,32 @@ func (c *IMClient) wakeBackwardBackfillAfterForward(ctx context.Context, portalK
 	c.Main.Bridge.WakeupBackfillQueue()
 }
 
+const forwardBackfillRetryDelay = time.Second
+
+// scheduleForwardBackfillRetry queues a forced resync after the current portal
+// event has returned and released bridgev2's forward-backfill lock. The event's
+// own framework context is independent of the cancelled FetchMessages context.
+func (c *IMClient) scheduleForwardBackfillRetry(portalKey networkid.PortalKey) {
+	login := c.UserLogin
+	time.AfterFunc(forwardBackfillRetryDelay, func() {
+		if login == nil {
+			return
+		}
+		login.QueueRemoteEvent(&simplevent.ChatResync{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatResync,
+				PortalKey: portalKey,
+				LogContext: func(lc zerolog.Context) zerolog.Context {
+					return lc.Str("source", "forward_backfill_retry")
+				},
+			},
+			CheckNeedsBackfillFunc: func(context.Context, *database.Message) (bool, error) {
+				return true, nil
+			},
+		})
+	})
+}
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	fetchStart := time.Now()
 	log := zerolog.Ctx(ctx)
@@ -8112,11 +8138,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// Use a select with ctx.Done() so we don't block the portal event
 		// loop indefinitely when all slots are taken — that causes "Portal
 		// event channel is still full" errors and dropped events.
-		select {
-		case c.forwardBackfillSem <- struct{}{}:
-		case <-ctx.Done():
+		if err := waitForForwardBackfillSlot(ctx, c.forwardBackfillSem, func() {
+			c.scheduleForwardBackfillRetry(params.Portal.PortalKey)
+		}); err != nil {
 			log.Warn().Str("portal_id", portalID).Msg("Forward backfill: context cancelled while waiting for semaphore")
-			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
+			return nil, err
 		}
 		defer func() { <-c.forwardBackfillSem }()
 		log.Info().
