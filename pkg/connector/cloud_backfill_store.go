@@ -315,6 +315,19 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
+	// Privacy-scrubber fast path: covers the candidate scan shared by
+	// scrubBridgedBodies and scrubReactionText (body_scrubbed=FALSE AND
+	// updated_ts < cutoff). Without it every 1000-row scrub chunk
+	// full-scanned cloud_message (~276k rows in production) because neither
+	// existing index includes body_scrubbed/updated_ts. Partial, so
+	// steady-state size tracks only the un-scrubbed backlog. Created here
+	// rather than in the queries list above because body_scrubbed does not
+	// exist on legacy tables until the column migrations above have run.
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_message_scrub_idx
+		ON cloud_message (login_id, updated_ts) WHERE body_scrubbed=FALSE`); err != nil {
+		return fmt.Errorf("failed to create cloud_message_scrub_idx: %w", err)
+	}
+
 	// Privacy migration: pre-existing soft-deleted rows from before the
 	// privacy branch never went through softDeleteMessageByGUID's inline
 	// scrub. They sit with deleted=TRUE and original text/subject/sender,
@@ -3731,8 +3744,52 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// the updated_ts grace window only buys ~5 min; without this exclusion
 	// the scrubber would re-scrub partway through, and cloudRowToBackfillMessages'
 	// BodyScrubbed skip would silently drop the un-backfilled tail.
+	// Delivered-guid set: computed ONCE per pass instead of being
+	// re-materialized inside every chunk's subquery (see
+	// loadBridgedGUIDSet). Membership semantics are identical to the old
+	// in-query UNION; only the cost model changed.
+	bridged, err := s.loadBridgedGUIDSet(ctx, bridgeID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to load bridged guid set: %w", err)
+	}
+
+	// Candidate rows: un-scrubbed, non-reaction, past the grace window,
+	// oldest first. Served by cloud_message_scrub_idx (login_id,
+	// updated_ts) WHERE body_scrubbed=FALSE.
+	candidates, err := s.scrubCandidates(ctx, cutoff, excludePortals)
+	if err != nil {
+		return total, err
+	}
+
+	for start := 0; start < len(candidates); start += chunkSize {
+		batchEnd := start + chunkSize
+		if batchEnd > len(candidates) {
+			batchEnd = len(candidates)
+		}
+		n, err := s.scrubBatchIfEligible(ctx, cutoff, bridged, candidates[start:batchEnd])
+		if err != nil {
+			return total, err
+		}
+		total += n
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		default:
+		}
+	}
+	return total, nil
+}
+
+// scrubCandidates lists the rows scrubBridgedBodies may consider this pass:
+// un-scrubbed, non-reaction, older than the grace-window cutoff, optionally
+// excluding portals with active restore pipelines. Ordered oldest-first so
+// the oldest plaintext drains first when the backlog exceeds one pass.
+// deleted=TRUE is returned as a flag because soft-deleted rows are scrubbed
+// unconditionally (their Matrix-side message row is usually long gone), so
+// they bypass the delivered-set membership test.
+func (s *cloudBackfillStore) scrubCandidates(ctx context.Context, cutoff int64, excludePortals []string) ([]cloudScrubCandidate, error) {
 	exclusionSQL := ""
-	args := []any{s.loginID, cutoff, bridgeID}
+	args := []any{s.loginID, cutoff}
 	if len(excludePortals) > 0 {
 		placeholders := make([]string, 0, len(excludePortals))
 		for _, pid := range excludePortals {
@@ -3741,72 +3798,107 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		}
 		exclusionSQL = " AND portal_id NOT IN (" + strings.Join(placeholders, ",") + ")"
 	}
-	args = append(args, chunkSize)
-	limitPlaceholder := fmt.Sprintf("$%d", len(args))
+	rows, err := s.db.Query(ctx, `
+		SELECT guid, COALESCE(deleted, FALSE) FROM cloud_message
+		WHERE login_id=$1 AND body_scrubbed=FALSE
+		  AND (tapback_type IS NULL OR tapback_type < 2000)
+		  AND updated_ts < $2`+exclusionSQL+`
+		ORDER BY updated_ts ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list scrub candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []cloudScrubCandidate
+	for rows.Next() {
+		var c cloudScrubCandidate
+		if err := rows.Scan(&c.guid, &c.deleted); err != nil {
+			return nil, fmt.Errorf("scan scrub candidate: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
 
-	// The outer UPDATE re-checks body_scrubbed=FALSE AND updated_ts < cutoff
-	// at write time so concurrent upsert / clearBodyScrubByPortalID between
-	// subquery eval and outer apply can't be silently overwritten. The
-	// subquery picks candidate guids; the outer WHERE confirms the row's
-	// state hasn't changed under us. Required because SQLite's IN-subquery
-	// materializes the guid list once, then applies the UPDATE without
-	// re-evaluating the predicate per row.
-	// Match bridged rows by membership in the set of guids that have a `message`
-	// row, computed ONCE per chunk, instead of a per-row correlated EXISTS with
-	// UPPER()+LIKE (which can't use an index and ran ~25s over a 40k-row backlog,
-	// tripping dbutil's 1s slow-query warning every chunk). bridgev2 stores the
-	// base message id in `id`; part-suffixed ids (`<guid>_<part>`) are normalised
-	// back to the base guid via substr-to-first-underscore (guids are UUIDs, no
-	// underscores). UPPER() on both sides preserves the APNs-uppercase vs
-	// CloudKit-mixed-case matching the EXISTS form had.
-	// instr() is SQLite-only; Postgres spells the same function strpos().
-	query := strings.ReplaceAll(`
-		UPDATE cloud_message
-		SET text=NULL,
-		    subject=NULL,
-		    sender='',
-		    tapback_emoji=NULL,
-		    body_scrubbed=TRUE
-		WHERE login_id=$1
-		  AND body_scrubbed=FALSE
-		  AND updated_ts < $2
-		  AND guid IN (
-		    SELECT guid FROM cloud_message
-		    WHERE login_id=$1
-		      AND body_scrubbed=FALSE
-		      AND (tapback_type IS NULL OR tapback_type < 2000)
-		      AND updated_ts < $2
-		      AND (
-		        deleted=TRUE
-		        OR UPPER(guid) IN (
-		          SELECT UPPER(id) FROM message
-		          WHERE bridge_id=$3 AND (room_receiver=$1 OR room_receiver='')
-		          UNION
-		          SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
-		          WHERE bridge_id=$3 AND {{INSTR}}(id, '_') > 0
-		            AND (room_receiver=$1 OR room_receiver='')
-		        )
-		      )`+exclusionSQL+`
-		    LIMIT `+limitPlaceholder+`
-		  )
-	`, "{{INSTR}}", sqlInstrFunc(s.db))
-	for {
-		result, err := s.db.Exec(ctx, query, args...)
-		if err != nil {
-			return total, fmt.Errorf("failed to scrub bridged bodies: %w", err)
+// scrubBatchIfEligible nulls plaintext for one chunk of candidates. Every row
+// is re-checked at write time (body_scrubbed=FALSE AND updated_ts < cutoff,
+// plus delivered-set membership unless the row was already soft-deleted) so a
+// concurrent upsert or restore-chat clear between listing and writing cannot
+// be clobbered — same guarantee the old single-statement form provided.
+func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff int64, bridged map[string]struct{}, candidates []cloudScrubCandidate) (int64, error) {
+	guids := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if c.deleted {
+			guids = append(guids, c.guid)
+			continue
 		}
-		n, _ := result.RowsAffected()
-		total += n
-		if n < chunkSize {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return total, ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+		if _, ok := bridged[strings.ToLower(c.guid)]; ok {
+			guids = append(guids, c.guid)
 		}
 	}
-	return total, nil
+	if len(guids) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, len(guids))
+	args := make([]any, 0, len(guids)+2)
+	args = append(args, s.loginID, cutoff)
+	for i, g := range guids {
+		args = append(args, g)
+		placeholders[i] = fmt.Sprintf("$%d", i+3)
+	}
+	res, err := s.db.Exec(ctx, `
+		UPDATE cloud_message
+		SET text=NULL, subject=NULL, sender='',
+		    tapback_emoji=NULL, body_scrubbed=TRUE
+		WHERE login_id=$1 AND body_scrubbed=FALSE AND updated_ts < $2
+		  AND guid IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to scrub bridged bodies: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// cloudScrubCandidate is one row listed by scrubCandidates.
+type cloudScrubCandidate struct {
+	guid    string
+	deleted bool
+}
+
+// loadBridgedGUIDSet returns the set of cloud_message guids (lower-cased)
+// that bridgev2 has delivered for this login: rows in bridgev2's `message`
+// table whose id matches either directly (UPPER(id)) or after stripping the
+// part suffix (`<guid>_<part>`, normalised back to base guid). This is the
+// membership test scrubBridgedBodies used to inline as a UNION subquery on
+// every 1000-row chunk — materializing it once per pass removes two full
+// scans of the `message` table per chunk (261k rows in production).
+//
+// Case handling is unchanged from the SQL form: APNs delivers UUIDs
+// uppercase while CloudKit stores them mixed-case, so both sides are
+// UPPER()-ed before comparison; here that means ids are lower-cased into
+// the set and lookups use strings.ToLower(guid).
+func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID string) (map[string]struct{}, error) {
+	instr := sqlInstrFunc(s.db)
+	query := strings.ReplaceAll(`
+		SELECT UPPER(id) FROM message
+		WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='')
+		UNION
+		SELECT UPPER(substr(id, 1, {{INSTR}}(id, '_') - 1)) FROM message
+		WHERE bridge_id=$1 AND {{INSTR}}(id, '_') > 0
+		  AND (room_receiver=$2 OR room_receiver='')`, "{{INSTR}}", instr)
+	rows, err := s.db.Query(ctx, query, bridgeID, string(s.loginID))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load bridged guid set: %w", err)
+	}
+	defer rows.Close()
+	set := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan bridged guid: %w", err)
+		}
+		set[strings.ToLower(id)] = struct{}{}
+	}
+	return set, rows.Err()
 }
 
 // scrubReactionText nulls text/subject on reaction rows (tapback_type >= 2000),
