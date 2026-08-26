@@ -94,3 +94,25 @@ rows awaiting upstream delivery — which is correct behavior.
 - Backfill failures ("M_UNKNOWN (HTTP 500): failed to save message batch")
   are server-side (hungryserv) and orthogonal; they also explain why some
   rows legitimately remain un-scrubbed.
+
+## Adjacent issues observed during deployment (not addressed here)
+
+Post-deploy monitoring surfaced two unrelated slow paths worth separate
+attention:
+
+1. **Startup heal pass** — `normalizeGroupMessagePortalIDs`
+   (`cloud_backfill_store.go`) took **524s** on first boot after this deploy,
+   stalling other statements while it ran. It is a correlated-subquery UPDATE
+   over all `gid:` cloud_message rows (LOWER() comparisons — unindexable as
+   written) and only runs on the first cloud-sync pass after a restart, so it
+   had not executed since Aug 13. Consider chunking or materializing the
+   chat→canonical-portal mapping before the UPDATE.
+2. **Backfill read path** — `queryMessages` / `listPortalIDsWithNewestTimestamp`
+   show multi-second full reads when the backward-backfill queue retries large
+   portals. These run concurrently with Beeper's current HTTP 500
+   ("failed to save message batch") failures, which cause endless retries;
+   fixing the server-side acceptance issue (or adding retry backoff) will
+   bound this load.
+
+Neither interacts with the scrubber fix; both were previously masked by the
+scrubber dominating the slow-query log.
