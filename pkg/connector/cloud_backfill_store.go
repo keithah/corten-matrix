@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -18,6 +19,19 @@ import (
 type cloudBackfillStore struct {
 	db      *dbutil.Database
 	loginID networkid.UserLoginID
+
+	// The periodic ticker and post-sync housekeeping can overlap. Serializing
+	// passes makes this cache safe and avoids duplicate reader pressure.
+	scrubMu    sync.Mutex
+	scrubCache scrubCache
+}
+
+type scrubCache struct {
+	valid             bool
+	cloudMaxUpdatedTS int64
+	messageMaxRowID   int64
+	exclusions        string
+	retryAfter        time.Time
 }
 
 type cloudMessageRow struct {
@@ -3962,7 +3976,21 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	if debugDisablePrivacy {
 		return 0, nil
 	}
-	cutoff := time.Now().Add(-graceWindow).UnixMilli()
+	// A restart always takes a full pass. Thereafter, unchanged CloudKit
+	// content, bridged-message state and restore exclusions cannot make a new
+	// candidate eligible, so avoid re-reading the 263k/16k steady-state sets.
+	s.scrubMu.Lock()
+	defer s.scrubMu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-graceWindow).UnixMilli()
+	exclusions := strings.Join(excludePortals, "\x00")
+	if cloudMax, messageMax, ok, err := s.scrubWatermarks(ctx); err != nil {
+		return 0, err
+	} else if ok && s.scrubCache.valid && cloudMax == s.scrubCache.cloudMaxUpdatedTS &&
+		messageMax == s.scrubCache.messageMaxRowID && exclusions == s.scrubCache.exclusions &&
+		(s.scrubCache.retryAfter.IsZero() || now.Before(s.scrubCache.retryAfter)) {
+		return 0, nil
+	}
 	const chunkSize = 1000
 
 	// Candidate enumeration is one index-backed pass, so undelivered rows cannot
@@ -4011,7 +4039,31 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+	// Snapshot after writes. A fresh row inside the grace period receives one
+	// future pass when it becomes eligible; stable undelivered rows do not keep
+	// forcing full scans forever.
+	if cloudMax, messageMax, ok, stateErr := s.scrubWatermarks(ctx); stateErr == nil && ok {
+		s.scrubCache = scrubCache{valid: true, cloudMaxUpdatedTS: cloudMax, messageMaxRowID: messageMax, exclusions: exclusions}
+		if cloudMax > cutoff {
+			s.scrubCache.retryAfter = now.Add(graceWindow)
+		}
+	}
 	return total, nil
+}
+
+// scrubWatermarks uses cheap SQLite B-tree aggregates as conservative change
+// signals. Other backends retain the existing full-pass behavior.
+func (s *cloudBackfillStore) scrubWatermarks(ctx context.Context) (cloudMax, messageMax int64, ok bool, err error) {
+	if s.db.Dialect != dbutil.SQLite {
+		return 0, 0, false, nil
+	}
+	if err = s.db.QueryRow(ctx, `SELECT COALESCE(MAX(updated_ts), 0) FROM cloud_message WHERE login_id=$1 AND body_scrubbed=FALSE`, s.loginID).Scan(&cloudMax); err != nil {
+		return 0, 0, false, fmt.Errorf("read cloud scrub watermark: %w", err)
+	}
+	if err = s.db.QueryRow(ctx, `SELECT COALESCE(MAX(rowid), 0) FROM message`).Scan(&messageMax); err != nil {
+		return 0, 0, false, fmt.Errorf("read bridged message watermark: %w", err)
+	}
+	return cloudMax, messageMax, true, nil
 }
 
 type cloudScrubCandidate struct {
@@ -4123,7 +4175,6 @@ func (s *cloudBackfillStore) scrubBatchIfEligible(ctx context.Context, cutoff in
 // sender and tapback_emoji are preserved so re-backfill still attributes and
 // renders the reaction (including custom emoji).
 func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow time.Duration) (int64, error) {
-	// DEVELOPMENT-ONLY: when privacy is disabled, leave plaintext in place.
 	if debugDisablePrivacy {
 		return 0, nil
 	}
@@ -4131,26 +4182,46 @@ func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow 
 	const chunkSize = 1000
 	var total int64
 	for {
-		result, err := s.db.Exec(ctx, `
-			UPDATE cloud_message
-			SET text=NULL, subject=NULL, body_scrubbed=TRUE
-			WHERE login_id=$1 AND tapback_type >= 2000
-			  AND body_scrubbed=FALSE AND updated_ts < $2
-			  AND guid IN (
-			    SELECT guid FROM cloud_message
-			    WHERE login_id=$1 AND tapback_type >= 2000
-			      AND body_scrubbed=FALSE AND updated_ts < $2
-			      AND (COALESCE(text, '') <> '' OR COALESCE(subject, '') <> '')
-			    LIMIT $3
-			  )
-		`, s.loginID, cutoff, chunkSize)
+		rows, err := s.db.Query(ctx, `SELECT guid FROM cloud_message
+			WHERE login_id=$1 AND tapback_type >= 2000 AND body_scrubbed=FALSE AND updated_ts < $2
+			  AND (COALESCE(text, '') <> '' OR COALESCE(subject, '') <> '') LIMIT $3`, s.loginID, cutoff, chunkSize)
+		if err != nil {
+			return total, fmt.Errorf("failed to list reaction scrub candidates: %w", err)
+		}
+		var guids []string
+		for rows.Next() {
+			var guid string
+			if err := rows.Scan(&guid); err != nil {
+				rows.Close()
+				return total, err
+			}
+			guids = append(guids, guid)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return total, err
+		}
+		rows.Close()
+		if len(guids) == 0 {
+			return total, nil
+		}
+		args := make([]any, 0, len(guids)+2)
+		args = append(args, s.loginID, cutoff)
+		ph := make([]string, len(guids))
+		for i, guid := range guids {
+			args = append(args, guid)
+			ph[i] = fmt.Sprintf("$%d", i+3)
+		}
+		result, err := s.db.Exec(ctx, `UPDATE cloud_message SET text=NULL, subject=NULL, body_scrubbed=TRUE
+			WHERE login_id=$1 AND tapback_type >= 2000 AND body_scrubbed=FALSE AND updated_ts < $2
+			  AND guid IN (`+strings.Join(ph, ",")+`)`, args...)
 		if err != nil {
 			return total, fmt.Errorf("failed to scrub reaction text: %w", err)
 		}
 		n, _ := result.RowsAffected()
 		total += n
-		if n < chunkSize {
-			break
+		if len(guids) < chunkSize {
+			return total, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -4158,7 +4229,6 @@ func (s *cloudBackfillStore) scrubReactionText(ctx context.Context, graceWindow 
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	return total, nil
 }
 
 // scrubUnbridgedTail nulls plaintext on cloud_message rows that fall OUTSIDE

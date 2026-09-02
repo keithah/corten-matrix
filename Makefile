@@ -251,7 +251,7 @@ ensure-rustpush-source:
 	  '^    pub expiration: SystemTime,'
 	@$(RP_PATCH) rp_patch "FetchedToken re-export" $(APA_DIR)/icloud-auth/src/lib.rs \
 	  's/^pub use client::\{AppleAccount, LoginState,/pub use client::{AppleAccount, FetchedToken, LoginState,/' \
-	  'pub use client::\{AppleAccount, FetchedToken,'
+	  '^pub use client::.*FetchedToken,'
 # Ignore self-exclusion in fast_forward_trust (Clique self-eviction fix; ports 9f29ff1).
 	@$(RP_PATCH) rp_patch "keychain self-exclusion" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
 	  's/^            for excluded in &trust\.excludeds \{$$/            let my_id = &state.user_identity.as_ref().unwrap().identifier;\n            for excluded in &trust.excludeds {\n                if excluded == my_id {\n                    warn!(\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\n                        excluded,\n                        peer.0.hash.as_ref().unwrap()\n                    );\n                    continue;\n                }/' \

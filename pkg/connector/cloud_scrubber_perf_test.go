@@ -271,3 +271,44 @@ func TestScrubBatchRechecksPendingBackfillAtWriteTime(t *testing.T) {
 		t.Fatalf("message text = %q (valid=%v), want preserved", text.String, text.Valid)
 	}
 }
+
+func TestScrubWatermarkSkipsUnchangedStableCandidates(t *testing.T) {
+	ctx := context.Background()
+	db := newTestSQLiteDB(t)
+	store := newCloudBackfillStore(db, testSQLLoginID)
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	createScrubberBridgeMessageTable(t, db, ctx)
+	now := time.Now().Add(-2 * time.Hour).UnixMilli()
+	if err := store.upsertMessageBatch(ctx, []cloudMessageRow{{GUID: "stable-unbridged", PortalID: "gid:stable", TimestampMS: now, Service: "iMessage", Text: "keep"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE cloud_message SET updated_ts=$1 WHERE login_id=$2 AND guid='stable-unbridged'`, now, testSQLLoginID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.scrubBridgedBodies(ctx, "bridge", time.Minute, nil); err != nil {
+		t.Fatal(err)
+	}
+	cache := store.scrubCache
+	if !cache.valid {
+		t.Fatal("first pass did not cache watermarks")
+	}
+	if _, err := store.scrubBridgedBodies(ctx, "bridge", time.Minute, nil); err != nil {
+		t.Fatal(err)
+	}
+	if store.scrubCache != cache {
+		t.Fatal("unchanged pass should not alter watermarks")
+	}
+	insertScrubberBridgeMessage(t, db, ctx, "stable-unbridged", "bridge", string(testSQLLoginID))
+	if _, err := store.scrubBridgedBodies(ctx, "bridge", time.Minute, nil); err != nil {
+		t.Fatal(err)
+	}
+	var scrubbed bool
+	if err := db.QueryRow(ctx, `SELECT body_scrubbed FROM cloud_message WHERE login_id=$1 AND guid='stable-unbridged'`, testSQLLoginID).Scan(&scrubbed); err != nil {
+		t.Fatal(err)
+	}
+	if !scrubbed {
+		t.Fatal("new bridge row did not invalidate watermark cache")
+	}
+}
