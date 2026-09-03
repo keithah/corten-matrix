@@ -32,6 +32,9 @@ type scrubCache struct {
 	messageMaxRowID   int64
 	exclusions        string
 	retryAfter        time.Time
+	// candidates are old CloudKit rows that remained unbridged after the last
+	// complete pass. New bridgev2 rows only need comparison with this set.
+	candidates map[string]cloudScrubCandidate
 }
 
 type cloudMessageRow struct {
@@ -3934,6 +3937,29 @@ func (s *cloudBackfillStore) loadBridgedGUIDSet(ctx context.Context, bridgeID st
 	return set, nil
 }
 
+// loadBridgedGUIDsSince reads only bridgev2 rows added after rowID. Its caller
+// compares them to retained CloudKit candidates instead of rescanning history.
+func (s *cloudBackfillStore) loadBridgedGUIDsSince(ctx context.Context, bridgeID string, rowID int64) (map[string]struct{}, error) {
+	rows, err := s.db.Query(ctx, `SELECT id FROM message WHERE rowid > $1 AND bridge_id=$2 AND (room_receiver=$3 OR room_receiver='')`, rowID, bridgeID, string(s.loginID))
+	if err != nil {
+		return nil, fmt.Errorf("load incremental bridged guids: %w", err)
+	}
+	defer rows.Close()
+	set := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan incremental bridged guid: %w", err)
+		}
+		normalized := strings.ToLower(id)
+		set[normalized] = struct{}{}
+		if suffix := strings.IndexByte(normalized, '_'); suffix > 0 {
+			set[normalized[:suffix]] = struct{}{}
+		}
+	}
+	return set, rows.Err()
+}
+
 // scrubBridgedBodies nulls plaintext message content (text, subject, sender,
 // tapback_emoji) on cloud_message rows whose corresponding Matrix event has
 // been successfully delivered (an entry exists in bridgev2's `message` table)
@@ -3984,12 +4010,39 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	now := time.Now()
 	cutoff := now.Add(-graceWindow).UnixMilli()
 	exclusions := strings.Join(excludePortals, "\x00")
-	if cloudMax, messageMax, ok, err := s.scrubWatermarks(ctx); err != nil {
+	cloudMax, messageMax, cacheable, err := s.scrubWatermarks(ctx)
+	if err != nil {
 		return 0, err
-	} else if ok && s.scrubCache.valid && cloudMax == s.scrubCache.cloudMaxUpdatedTS &&
-		messageMax == s.scrubCache.messageMaxRowID && exclusions == s.scrubCache.exclusions &&
+	}
+	if cacheable && s.scrubCache.valid && cloudMax == s.scrubCache.cloudMaxUpdatedTS &&
+		exclusions == s.scrubCache.exclusions &&
 		(s.scrubCache.retryAfter.IsZero() || now.Before(s.scrubCache.retryAfter)) {
-		return 0, nil
+		if messageMax == s.scrubCache.messageMaxRowID {
+			return 0, nil
+		}
+		if messageMax > s.scrubCache.messageMaxRowID {
+			// CloudKit state is unchanged. Read only bridgev2 rows added since the
+			// last full pass; retained candidates preserve the privacy guarantee.
+			newlyBridged, err := s.loadBridgedGUIDsSince(ctx, bridgeID, s.scrubCache.messageMaxRowID)
+			if err != nil {
+				return 0, err
+			}
+			matched := make([]cloudScrubCandidate, 0, len(newlyBridged))
+			for guid := range newlyBridged {
+				if candidate, ok := s.scrubCache.candidates[guid]; ok {
+					matched = append(matched, candidate)
+				}
+			}
+			n, err := s.scrubBatchIfEligible(ctx, cutoff, newlyBridged, matched)
+			if err != nil {
+				return 0, err
+			}
+			for _, candidate := range matched {
+				delete(s.scrubCache.candidates, strings.ToLower(candidate.guid))
+			}
+			s.scrubCache.messageMaxRowID = messageMax
+			return n, nil
+		}
 	}
 	const chunkSize = 1000
 
@@ -4043,7 +4096,16 @@ func (s *cloudBackfillStore) scrubBridgedBodies(ctx context.Context, bridgeID st
 	// future pass when it becomes eligible; stable undelivered rows do not keep
 	// forcing full scans forever.
 	if cloudMax, messageMax, ok, stateErr := s.scrubWatermarks(ctx); stateErr == nil && ok {
-		s.scrubCache = scrubCache{valid: true, cloudMaxUpdatedTS: cloudMax, messageMaxRowID: messageMax, exclusions: exclusions}
+		pending := make(map[string]cloudScrubCandidate)
+		for _, candidate := range candidates {
+			if candidate.deleted {
+				continue
+			}
+			if _, delivered := bridged[strings.ToLower(candidate.guid)]; !delivered {
+				pending[strings.ToLower(candidate.guid)] = candidate
+			}
+		}
+		s.scrubCache = scrubCache{valid: true, cloudMaxUpdatedTS: cloudMax, messageMaxRowID: messageMax, exclusions: exclusions, candidates: pending}
 		if cloudMax > cutoff {
 			s.scrubCache.retryAfter = now.Add(graceWindow)
 		}

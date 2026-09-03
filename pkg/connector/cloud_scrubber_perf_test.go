@@ -291,14 +291,14 @@ func TestScrubWatermarkSkipsUnchangedStableCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache := store.scrubCache
-	if !cache.valid {
-		t.Fatal("first pass did not cache watermarks")
+	if !cache.valid || len(cache.candidates) != 1 {
+		t.Fatalf("first pass cached %+v candidates, want one", len(cache.candidates))
 	}
 	if _, err := store.scrubBridgedBodies(ctx, "bridge", time.Minute, nil); err != nil {
 		t.Fatal(err)
 	}
-	if store.scrubCache != cache {
-		t.Fatal("unchanged pass should not alter watermarks")
+	if store.scrubCache.messageMaxRowID != cache.messageMaxRowID || len(store.scrubCache.candidates) != 1 {
+		t.Fatal("unchanged pass should retain cached watermarks and candidates")
 	}
 	insertScrubberBridgeMessage(t, db, ctx, "stable-unbridged", "bridge", string(testSQLLoginID))
 	if _, err := store.scrubBridgedBodies(ctx, "bridge", time.Minute, nil); err != nil {
@@ -309,6 +309,9 @@ func TestScrubWatermarkSkipsUnchangedStableCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !scrubbed {
-		t.Fatal("new bridge row did not invalidate watermark cache")
+		t.Fatal("new bridge row did not scrub retained candidate")
+	}
+	if len(store.scrubCache.candidates) != 0 {
+		t.Fatalf("scrubbed candidate remained cached: %+v", store.scrubCache.candidates)
 	}
 }
