@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   close:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     # Only the owner and invited collaborators are exempt. COLLABORATOR is the
     # association GitHub reports for anyone with write access, so this tracks the
     # repo's collaborator list automatically -- no usernames to keep in sync.
