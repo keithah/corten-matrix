@@ -46,7 +46,7 @@ jobs:
   # time. Draft releases are intentionally excluded by the /releases/latest API.
   resolve-release-version:
     name: Resolve release version
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     outputs:
       release_tag: ${{ steps.version.outputs.release_tag }}
     steps:
@@ -132,7 +132,7 @@ jobs:
   verify-rustpush-patches:
     name: Apply and verify all portable RustPush patches
     needs: resolve-release-version
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 30
     outputs:
       opencider_ref_token: ${{ steps.opencider.outputs.ref_token }}
@@ -201,7 +201,7 @@ jobs:
     if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
     # Cross-compile x86_64 on Apple Silicon: clang and Rust both target x86_64
     # explicitly, and this runner is substantially faster than the Intel host.
-    runs-on: macos-15
+    runs-on: tenki-macos-15-small
     timeout-minutes: 60
     steps:
       - name: Check out public bridge
@@ -269,7 +269,7 @@ jobs:
     name: macOS arm64 slice
     needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Mac only' || inputs.build_scope == 'All platforms'
-    runs-on: macos-15
+    runs-on: tenki-macos-15-small
     timeout-minutes: 60
     steps:
       - name: Check out public bridge
@@ -335,7 +335,7 @@ jobs:
     name: Linux amd64
     needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Linux AMD64 only' || inputs.build_scope == 'Linux both' || inputs.build_scope == 'All platforms'
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     # Build directly on the free native runner with Zig's glibc 2.28 target.
     # This removes both Rocky containers and the duplicate package bootstrap.
     timeout-minutes: 60
@@ -399,7 +399,7 @@ jobs:
     name: Linux arm64
     needs: [resolve-release-version, verify-rustpush-patches]
     if: inputs.build_scope == 'Linux ARM64 only' || inputs.build_scope == 'Linux both' || inputs.build_scope == 'All platforms'
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubicloud-standard-2-arm-ubuntu-2404
     # Build directly on the free native runner with Zig's glibc 2.28 target.
     # This removes both Rocky containers and the duplicate package bootstrap.
     timeout-minutes: 60
@@ -571,7 +571,7 @@ jobs:
       needs.assemble-macos.result == 'success' &&
       needs.linux-amd64.result == 'success' &&
       needs.linux-arm64.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 15
     # This packaging-only job is the sole release mutation boundary. It receives
     # no OpenCider secret or private checkout and compiles no source.
